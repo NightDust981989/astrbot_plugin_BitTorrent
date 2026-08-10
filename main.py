@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import httpx
 from bs4 import BeautifulSoup
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.core import AstrBotConfig
@@ -86,8 +86,8 @@ class WhatsLinkService:
 
     API_URL = "https://whatslink.info/api/v1/link"
 
-    def __init__(self, timeout: int = 15):
-        self.client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+    def __init__(self, client: httpx.AsyncClient):
+        self.client = client
 
     async def get_preview(self, magnet_url: str) -> dict | None:
         """查询磁链预览信息，失败时返回 None"""
@@ -101,34 +101,11 @@ class WhatsLinkService:
             logger.warning(f"whatslink API 请求失败：{e}")
             return None
 
-    async def close(self):
-        await self.client.aclose()
-
 
 class MagnetSearchService:
-    def __init__(self, config: MagnetConfig):
+    def __init__(self, config: MagnetConfig, client: httpx.AsyncClient):
         self.config = config
-        self.client = None  # 全局一个client
-        self._init_client()
-
-    def _init_client(self):
-        """client初始化"""
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Linux; U; Android 2.2; en-us; Droid Build/FRG22D) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.9",
-            "Origin": self.config.base_url,
-            "Referer": self.config.base_url
-        }
-
-        # 复用客户端
-        self.client = httpx.AsyncClient(
-            headers=headers,
-            cookies=self.config.captcha_cookies,
-            timeout=self.config.request_timeout,
-            follow_redirects=False,
-            verify=False
-        )
+        self.client = client
 
     async def search(self, keyword: str, sort_param: str = "") -> List[dict]:
         """搜索逻辑：返回包含原始数据的 dict 列表"""
@@ -154,7 +131,7 @@ class MagnetSearchService:
             soup = BeautifulSoup(decrypted_html, "lxml")
             result_container = soup.find("ul", id="Search_list_wrapper")
             if not result_container:
-                logger.warning(f"无搜索结果容器")
+                logger.error(f"网站不可用")
                 return []
 
             detail_links = []
@@ -259,7 +236,7 @@ def _format_size(size_bytes) -> str:
     "astrbot_plugin_BitTorrent",
     "NightDust981989",
     "BitTorrent磁力搜索",
-    "1.3.0",
+    "1.4.0",
     "https://github.com/NightDust981989/astrbot_plugin_BitTorrent"
 )
 class MagnetSearchPlugin(Star):
@@ -282,13 +259,34 @@ class MagnetSearchPlugin(Star):
             max_results=max_results,
             request_timeout=request_timeout
         )
-        self.search_service = MagnetSearchService(self.magnet_config)
-        self.whatslink_service = WhatsLinkService(timeout=request_timeout)
+
+        # 统一创建 HTTP 客户端
+        magnet_headers = {
+            "User-Agent": "Mozilla/5.0 (Linux; U; Android 2.2; en-us; Droid Build/FRG22D) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Origin": self.magnet_config.base_url,
+            "Referer": self.magnet_config.base_url
+        }
+        self._magnet_client = httpx.AsyncClient(
+            headers=magnet_headers,
+            cookies=self.magnet_config.captcha_cookies,
+            timeout=self.magnet_config.request_timeout,
+            follow_redirects=False,
+            verify=False
+        )
+        self._preview_client = httpx.AsyncClient(
+            timeout=request_timeout,
+            follow_redirects=True
+        )
+
+        self.search_service = MagnetSearchService(self.magnet_config, self._magnet_client)
+        self.whatslink_service = WhatsLinkService(self._preview_client)
         logger.info(f"磁力搜索插件初始化完成，使用站点：{base_url}{search_path}")
 
     async def terminate(self):
-        await self.search_service.client.aclose()
-        await self.whatslink_service.close()
+        await self._magnet_client.aclose()
+        await self._preview_client.aclose()
 
     @staticmethod
     def _format_result(idx: int, res: dict) -> str:
@@ -422,3 +420,86 @@ class MagnetSearchPlugin(Star):
                 chain.append(Comp.Image.fromURL(screenshot_url))
 
         yield event.chain_result(chain)
+
+    @filter.llm_tool(name="search_magnet")
+    async def search_magnet(self, event: AstrMessageEvent, keyword: str, sort: str = "") -> MessageEventResult:
+        '''搜索磁力链接资源，帮你寻找电影、软件、学习资料等。
+
+        Args:
+            keyword(string): 搜索关键词，例如"安达与岛村"
+            sort(string): 排序方式，可选值：热门、时间、大小、相关度。默认按相关度排序
+        '''
+        sort_param = MagnetUtils.get_sort_param(sort)
+        results = await self.search_service.search(keyword, sort_param)
+
+        if not results:
+            yield event.plain_result("未找到相关磁力链接，网站失效或网络问题")
+        elif len(results) == 1 and results[0].get("error") and not results[0].get("title"):
+            yield event.plain_result(results[0]["error"])
+        else:
+            # 第一次发送：所有基础结果 + 预览文本
+            text_chain = [Comp.Plain(f"共找到 {len(results)} 条有效结果：")]
+            preview_nodes = []
+            for idx, res in enumerate(results, 1):
+                text_chain.append(Comp.Plain(self._format_result(idx, res)))
+                preview = None
+                if self.enable_preview and res.get("magnet_link"):
+                    preview = await self.whatslink_service.get_preview(res["magnet_link"])
+                if preview:
+                    text_chain.append(Comp.Plain(
+                        f"‎\n--- 预览 ---\n‎"
+                        f"类型：{preview.get('file_type') or '未知'}\n"
+                        f"文件数：{preview.get('count') or '未知'}"
+                    ))
+                    # 收集截图到 Node
+                    if preview.get("screenshots"):
+                        screenshot_url = preview["screenshots"][0].get("screenshot")
+                        if screenshot_url:
+                            node_content = [Comp.Plain(f"结果{idx}预览图"), Comp.Image.fromURL(screenshot_url)]
+                        else:
+                            node_content = [Comp.Plain(f"结果{idx}无预览图")]
+                    else:
+                        node_content = [Comp.Plain(f"结果{idx}无预览图")]
+                else:
+                    node_content = [Comp.Plain(f"结果{idx}无预览图")]
+                preview_nodes.append(Comp.Node(
+                    content=node_content,
+                    name=event.get_sender_name(),
+                    uin=str(event.get_sender_id()),
+                ))
+            if self.enable_preview:
+                text_chain.append(Comp.Plain("‎\n预览数据来源：whatslink.info"))
+            yield event.chain_result(text_chain)
+
+            # 第二次发送：预览图合并转发
+            if self.enable_preview and preview_nodes:
+                yield event.chain_result([Comp.Nodes(nodes=preview_nodes)])
+
+    @filter.llm_tool(name="preview_magnet")
+    async def preview_magnet(self, event: AstrMessageEvent, magnet_url: str) -> MessageEventResult:
+        '''查询磁力链接的详细信息，包括文件名、类型、总大小、文件数量和预览截图。
+
+        Args:
+            magnet_url(string): 磁力链接，以magnet:?xt=urn:btih:开头
+        '''
+        if not magnet_url.startswith("magnet:"):
+            yield event.plain_result("请输入有效的磁力链接（以 magnet: 开头）")
+            return
+
+        preview = await self.whatslink_service.get_preview(magnet_url)
+        if not preview or not preview.get("name"):
+            yield event.plain_result("未查询到预览信息，链接可能无效或 API 暂不可用")
+        else:
+            text = (
+                f"文件名：{preview.get('name', '未知')}\n‎"
+                f"类型：{preview.get('file_type') or '未知'}\n"
+                f"总大小：{_format_size(preview.get('size', 0))}\n"
+                f"文件数：{preview.get('count') or '未知'}\n"
+                f"‎\n预览数据来源：whatslink.info"
+            )
+            chain = [Comp.Plain(text)]
+            if preview.get("screenshots"):
+                screenshot_url = preview["screenshots"][0].get("screenshot")
+                if screenshot_url:
+                    chain.append(Comp.Image.fromURL(screenshot_url))
+            yield event.chain_result(chain)
