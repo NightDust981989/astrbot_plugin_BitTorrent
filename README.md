@@ -4,7 +4,7 @@
 ## 核心特性
 1. 突破磁力狗重定向反爬：关闭自动重定向，提取原始搜索结果
 2. 配置完全自定义：支持修改站点地址、接口路径、超时时间等
-3. 自动解密：复刻站点window.atob+unescape加密逻辑
+3. 自动解密：复刻站点window.atob+decodeURIComponent加密逻辑
 4. 轻量无依赖：仅需基础HTTP/解析库，无需Playwright/Selenium
 5. 磁链预览：基于 whatslink.info API 自动展示文件信息和截图
 
@@ -22,8 +22,8 @@
 ## 配置项说明
 | 配置项          | 说明                                                                 | 默认值                          |
 |-----------------|----------------------------------------------------------------------|---------------------------------|
-| base_url        | 磁力狗站点基础地址，支持更换备用域名（如站点失效时）| https://clg.clgapp4.xyz        |
-| search_path     | 搜索接口路径，正常无需更改                                           | /cllj.php                       |
+| base_url        | 磁力狗站点基础地址，支持更换备用域名（如站点失效时）| https://clg38.xyz        |
+| search_path     | 搜索接口路径，正常无需更改                                           | /search                       |
 | max_results     | 单次搜索返回的最大结果数，建议 3-5 条（过多会增加解密耗时）| 3                               |
 | request_timeout | HTTP 请求超时时间（秒），详情页解密需耗时，建议 15-20 秒                | 15                              |
 | enable_preview  | 搜索结果是否附带 whatslink.info 预览（文件信息+截图），关闭后 btp 命令不受影响 | true                            |
@@ -46,7 +46,7 @@ btp magnet:?xt=urn:btih:xxxx
 - 时间/最新：按时间从新到旧排序
 - 大小/文件大小：按文件大小从大到小排序
 
-当原站点失效时，请访问 https://ciligoufabuye3.xyz 或发邮件至 clgdzzh@gmail.com 更新地址
+当原站点失效时，请访问磁力狗官网更新地址
 
 ## 许可证
 本插件遵循和AstrBot相同的许可证

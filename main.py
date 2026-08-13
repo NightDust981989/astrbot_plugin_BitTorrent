@@ -1,7 +1,7 @@
 import re
 import base64
 import urllib.parse
-from typing import List, Dict
+from typing import List
 from dataclasses import dataclass
 
 import httpx
@@ -20,13 +20,8 @@ class MagnetConfig:
     search_path: str       # 搜索接口路径
     max_results: int       # 最大返回结果数
     request_timeout: int   # 请求超时时间（秒）
-    captcha_cookies: Dict[str, str] = None  # 验证Cookie（固定值）
 
     def __post_init__(self):
-        # 初始化固定验证Cookie
-        self.captcha_cookies = {
-            "sssfwz": "qwsdsddsdsdse"
-        }
         # 处理base_url结尾的/（统一格式：不带结尾/）
         if self.base_url.endswith("/"):
             self.base_url = self.base_url.rstrip("/")
@@ -59,16 +54,27 @@ class MagnetUtils:
         return f"{base_url}/{relative_url}"
     
     @staticmethod
+    def encode_search_word(keyword: str) -> str:
+        """搜索关键词匹配站点加密逻辑"""
+        return base64.urlsafe_b64encode(keyword.encode("utf-8")).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def extract_atob_blob(html: str) -> str | None:
+        """提取页面中 window.atob("...") 加密内容"""
+        m = re.search(r'window\.atob\(\s*["\']([^"\']+)["\']', html)
+        return m.group(1) if m else None
+
+    @staticmethod
     def get_sort_param(sort_keyword: str) -> str:
         """
         排序关键词
         """
         sort_mapping = {
-            "相关度": "",
+            "相关度": "rele",
             "大小": "length",
             "文件大小": "length",
-            "热门": "hot",
-            "热门程度": "hot",
+            "热门": "hits",
+            "热门程度": "hits",
             "时间": "time",
             "最新": "time",
         }
@@ -77,8 +83,8 @@ class MagnetUtils:
         for key, value in sort_mapping.items():
             if key.lower() == sort_keyword:
                 return value
-        # 匹配不到返回空
-        return ""
+        # 匹配不到则回退默认
+        return "rele"
 
 # ========== 3. 核心搜索服务 ==========
 class WhatsLinkService:
@@ -107,69 +113,56 @@ class MagnetSearchService:
         self.config = config
         self.client = client
 
-    async def search(self, keyword: str, sort_param: str = "") -> List[dict]:
+    async def search(self, keyword: str, sort_param: str = "rele") -> List[dict]:
         """搜索逻辑：返回包含原始数据的 dict 列表"""
         results = []
 
         try:
             # ========== 构造搜索URL ==========
-            search_url = f"{self.config.base_url}{self.config.search_path}?name={urllib.parse.quote(keyword)}"
-            # 拼接排序参数
-            if sort_param:
-                search_url += f"&sort={sort_param}"
+            encoded_word = MagnetUtils.encode_search_word(keyword)
+            search_url = f"{self.config.base_url}{self.config.search_path}?word={encoded_word}&sort={sort_param}"
             logger.debug(f"GET请求：{search_url}")
-            
+
             # 发起请求
             response = await self.client.get(search_url)
             logger.debug(f"响应状态码：{response.status_code}")
-            
-            # 提取原始响应
-            raw_html = response.text
-            decrypted_html = raw_html
 
-            # ========== 提取xq.php链接（使用配置） ==========
+            # ========== 提取并解密搜索结果块（window.atob + decodeURIComponent） ==========
+            blob = MagnetUtils.extract_atob_blob(response.text)
+            if not blob:
+                logger.error("未找到搜索结果加密块，网站结构可能已变更")
+                return []
+
+            decrypted_html = MagnetUtils.decrypt_base64(blob)
             soup = BeautifulSoup(decrypted_html, "lxml")
             result_container = soup.find("ul", id="Search_list_wrapper")
             if not result_container:
-                logger.error(f"网站不可用")
+                logger.error("网站不可用")
                 return []
 
             detail_links = []
-            processed_urls = set()
-            # 遍历结果：最多取配置的max_results条
-            for idx, li in enumerate(result_container.find_all("li")):
+            # 遍历结果：最多取配置的max_results条（只取直接子 li，排除分页）
+            for idx, li in enumerate(result_container.find_all("li", recursive=False)):
                 if idx >= self.config.max_results:
                     break
-                if li.find("ul", class_="pagination"):
-                    continue
 
-                form_tag = li.find("form", action=re.compile(r"xq\.php"))
-                if not form_tag:
+                title_a = li.find("a", class_="SearchListTitle_result_title")
+                if not title_a:
                     continue
-                key_input = form_tag.find("input", attrs={"name": "key"})
-                if not key_input:
+                href = title_a.get("href", "").strip()
+                if not href:
                     continue
-                key = key_input.get("value", "").strip()
-                if not key:
-                    continue
+                title = title_a.get_text(strip=True) or f"搜索结果{idx+1}"
 
-                full_url = MagnetUtils.get_full_url(self.config.base_url, "/xq.php")
-                
-                # key去重
-                if key in processed_urls:
-                    continue
-                processed_urls.add(key)
-
-                # 提取基础信息
-                title = form_tag.find("a").text.strip() or f"搜索结果{idx+1}"
-                size = re.search(r"文件大小：([0-9.]+ [GMK]B)", li.text)
+                info = li.find("div", class_="Search_list_info")
+                info_text = info.get_text(" ", strip=True) if info else ""
+                size = re.search(r"文件大小：\s*([0-9.]+\s*[GMK]B)", info_text)
                 size = size.group(1).strip() if size else "未知大小"
-                create_time = re.search(r"创建时间：(\d{4}-\d{2}-\d{2})", li.text)
+                create_time = re.search(r"创建时间：\s*(\d{4}-\d{2}-\d{2})", info_text)
                 create_time = create_time.group(1).strip() if create_time else "未知时间"
 
                 detail_links.append({
-                    "url": full_url,
-                    "key": key,
+                    "url": MagnetUtils.get_full_url(self.config.base_url, href),
                     "title": title,
                     "size": size,
                     "create_time": create_time
@@ -178,26 +171,23 @@ class MagnetSearchService:
             if not detail_links:
                 return []
 
-            # ========== 解析详情页 ==========
+            # ========== 解析详情页提取磁力链接 ==========
             for link in detail_links:
                 try:
-                    # 改为POST
-                    detail_resp = await self.client.post(
-                        link["url"],
-                        data={"key": link["key"]}
-                    )
-                    detail_html = detail_resp.text
-
-                    # 提取磁力链接
-                    detail_soup = BeautifulSoup(detail_html, "lxml")
+                    detail_resp = await self.client.get(link["url"])
                     magnet_link = None
-                    magnet_a = detail_soup.find("a", href=re.compile(r"magnet:\?xt=urn:btih:"))
-                    if magnet_a:
-                        magnet_link = magnet_a.get("href").strip()
-                    if not magnet_link:
-                        magnet_match = re.search(r"magnet:\?xt=urn:btih:[a-fA-F0-9]{40,}[^\"']*", detail_html)
-                        if magnet_match:
-                            magnet_link = magnet_match.group().strip()
+
+                    detail_blob = MagnetUtils.extract_atob_blob(detail_resp.text)
+                    if detail_blob:
+                        detail_html = MagnetUtils.decrypt_base64(detail_blob)
+                        detail_soup = BeautifulSoup(detail_html, "lxml")
+                        magnet_a = detail_soup.find("a", class_="Information_magnet")
+                        if magnet_a:
+                            magnet_link = magnet_a.get("href", "").strip() or None
+                        if not magnet_link:
+                            magnet_match = re.search(r"magnet:\?xt=urn:btih:[a-fA-F0-9]{40,}[^\"']*", detail_html)
+                            if magnet_match:
+                                magnet_link = magnet_match.group().strip()
 
                     results.append({
                         "title": link["title"],
@@ -236,7 +226,7 @@ def _format_size(size_bytes) -> str:
     "astrbot_plugin_BitTorrent",
     "NightDust981989",
     "BitTorrent磁力搜索",
-    "1.4.0",
+    "1.5.0",
     "https://github.com/NightDust981989/astrbot_plugin_BitTorrent"
 )
 class MagnetSearchPlugin(Star):
@@ -246,8 +236,8 @@ class MagnetSearchPlugin(Star):
         # ========== 从插件配置文件读取参数 ==========
         magnet_config_dict = self.config.get("magnet_search", {})
 
-        base_url = magnet_config_dict.get("base_url", "https://clg.clgapp4.xyz")
-        search_path = magnet_config_dict.get("search_path", "/cllj.php")
+        base_url = magnet_config_dict.get("base_url", "https://clg38.xyz")
+        search_path = magnet_config_dict.get("search_path", "/search")
         max_results = int(magnet_config_dict.get("max_results", 3))
         request_timeout = int(magnet_config_dict.get("request_timeout", 15))
         self.enable_preview = magnet_config_dict.get("enable_preview", True)
@@ -270,7 +260,6 @@ class MagnetSearchPlugin(Star):
         }
         self._magnet_client = httpx.AsyncClient(
             headers=magnet_headers,
-            cookies=self.magnet_config.captcha_cookies,
             timeout=self.magnet_config.request_timeout,
             follow_redirects=False,
             verify=False
