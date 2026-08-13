@@ -7,14 +7,14 @@
       "base_url": {
         "description": "填写磁力狗站点地址",
         "type": "string",
-        "hint": "若链接失效，请访问 https://ciligoufabuye3.xyz 或发邮件至 clgdzzh@gmail.com 更新地址",
-        "default": "https://clg.clgapp4.xyz"
+        "hint": "若链接失效，请到磁力狗官网获取最新备用域名",
+        "default": "https://clg38.xyz"
       },
       "search_path": {
         "description": "搜索接口路径",
         "type": "string",
         "hint": "正常情况下无需修改。需以/开头，匹配站点实际接口",
-        "default": "/cllj.php"
+        "default": "/search"
       },
       "max_results": {
         "description": "单次搜索返回的最大结果数",
@@ -29,7 +29,7 @@
         "default": 15
       },
       "enable_preview": {
-        "description": "搜索结果是否附带 whatslink.info 预览（文件信息+截图）",
+        "description": "搜索结果是否附带预览（文件信息+截图）",
         "type": "bool",
         "hint": "关闭后 bt 搜索不再调用 whatslink API，btp 命令不受影响",
         "default": true
